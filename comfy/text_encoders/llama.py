@@ -252,6 +252,19 @@ class Qwen3_8BConfig:
     stop_tokens = [151643, 151645]
 
 @dataclass
+class Qwen3VL_8BConfig(Qwen3_8BConfig):
+    max_position_embeddings: int = 262144
+    rope_theta: float = 5000000.0
+    rope_dims = [24, 20, 20]
+    interleaved_mrope = True
+
+@dataclass
+class Qwen3VL_4BConfig(Qwen3VL_8BConfig):
+    hidden_size: int = 2560
+    intermediate_size: int = 9728
+    lm_head: bool = False  # 4B ties word embeddings
+
+@dataclass
 class Ovis25_2BConfig:
     vocab_size: int = 151936
     hidden_size: int = 2048
@@ -397,7 +410,7 @@ class RMSNorm(nn.Module):
 
 
 
-def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_dims=None, device=None):
+def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_dims=None, device=None, interleaved_mrope=False):
     if not isinstance(theta, list):
         theta = [theta]
 
@@ -415,16 +428,27 @@ def precompute_freqs_cis(head_dim, position_ids, theta, rope_scale=None, rope_di
         inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        cos = emb.cos()
-        sin = emb.sin()
-        if rope_dims is not None and position_ids.shape[0] > 1:
-            mrope_section = rope_dims * 2
-            cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
-            sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
+        if rope_dims is not None and position_ids.shape[0] > 1 and interleaved_mrope:
+            # Qwen3-VL interleaved MRoPE: T-freqs by default, H/W replace every 3rd dim.
+            freqs_inter = freqs[0].clone()
+            for axis_idx, offset in ((1, 1), (2, 2)):
+                length = rope_dims[axis_idx] * 3
+                idx = slice(offset, length, 3)
+                freqs_inter[..., idx] = freqs[axis_idx, ..., idx]
+            emb = torch.cat((freqs_inter, freqs_inter), dim=-1)
+            cos = emb.cos().unsqueeze(0)
+            sin = emb.sin().unsqueeze(0)
         else:
-            cos = cos.unsqueeze(1)
-            sin = sin.unsqueeze(1)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+            if rope_dims is not None and position_ids.shape[0] > 1:
+                mrope_section = rope_dims * 2
+                cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
+                sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(0)
+            else:
+                cos = cos.unsqueeze(1)
+                sin = sin.unsqueeze(1)
         sin_split = sin.shape[-1] // 2
         out.append((cos, sin[..., : sin_split], -sin[..., sin_split :]))
 
@@ -526,10 +550,8 @@ class Attention(nn.Module):
                 xv = xv[:, :, -sliding_window:]
                 attention_mask = attention_mask[..., -sliding_window:] if attention_mask is not None else None
 
-        xk = xk.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-        xv = xv.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-
-        output = optimized_attention(xq, xk, xv, self.num_heads, mask=attention_mask, skip_reshape=True)
+        gqa_kwargs = {"enable_gqa": True} if self.num_heads != self.num_kv_heads else {}
+        output = optimized_attention(xq, xk, xv, self.num_heads, mask=attention_mask, skip_reshape=True, **gqa_kwargs)
         return self.o_proj(output), present_key_value
 
 class MLP(nn.Module):
@@ -689,9 +711,11 @@ class Llama2_(nn.Module):
                                     self.config.rope_theta,
                                     self.config.rope_scale,
                                     self.config.rope_dims,
+                                    interleaved_mrope=getattr(self.config, "interleaved_mrope", False),
                                     device=device)
 
-    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True, dtype=None, position_ids=None, embeds_info=[], past_key_values=None, input_ids=None):
+    def forward(self, x, attention_mask=None, embeds=None, num_tokens=None, intermediate_output=None, final_layer_norm_intermediate=True,
+                dtype=None, position_ids=None, embeds_info=[], past_key_values=None, input_ids=None,deepstack_embeds=None, visual_pos_masks=None):
         if embeds is not None:
             x = embeds
         else:
@@ -754,6 +778,10 @@ class Llama2_(nn.Module):
 
             if current_kv is not None:
                 next_key_values.append(current_kv)
+
+            # DeepStack: add per-layer visual features into the first len() decoder layers at image positions (Qwen3-VL)
+            if deepstack_embeds is not None and i < len(deepstack_embeds):
+                x[visual_pos_masks] = x[visual_pos_masks] + deepstack_embeds[i].to(x)
 
             if i == intermediate_output:
                 intermediate = x.clone()
@@ -848,7 +876,7 @@ class BaseGenerate:
                                     torch.empty([batch, model_config.num_key_value_heads, max_cache_len, model_config.head_dim], device=device, dtype=execution_dtype), 0))
         return past_key_values
 
-    def generate(self, embeds=None, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.9, min_p=0.0, repetition_penalty=1.0, seed=42, stop_tokens=None, initial_tokens=[], execution_dtype=None, min_tokens=0, presence_penalty=0.0, initial_input_ids=None):
+    def generate(self, embeds=None, do_sample=True, max_length=256, temperature=1.0, top_k=50, top_p=0.9, min_p=0.0, repetition_penalty=1.0, seed=42, stop_tokens=None, initial_tokens=[], execution_dtype=None, min_tokens=0, presence_penalty=0.0, initial_input_ids=None, position_ids=None, deepstack_embeds=None, visual_pos_masks=None):
         device = embeds.device
 
         if stop_tokens is None:
@@ -872,10 +900,18 @@ class BaseGenerate:
         generated_token_ids = []
         pbar = comfy.utils.ProgressBar(max_length)
 
+        # MRoPE: prefill uses explicit 3D position_ids, decode continues from the last position
+        next_pos = int(position_ids[:, -1].max()) + 1 if position_ids is not None else None
+
         # Generation loop
         current_input_ids = initial_input_ids
         for step in tqdm(range(max_length), desc="Generating tokens"):
-            x, _, past_key_values = self.model.forward(None, embeds=embeds, attention_mask=None, past_key_values=past_key_values, input_ids=current_input_ids)
+            # DeepStack visual features are injected on the prefill only; gemma4's forward lacks these kwargs.
+            extra = {}
+            if step == 0 and deepstack_embeds is not None:
+                extra["deepstack_embeds"] = deepstack_embeds
+                extra["visual_pos_masks"] = visual_pos_masks
+            x, _, past_key_values = self.model.forward(None, embeds=embeds, attention_mask=None, past_key_values=past_key_values, input_ids=current_input_ids, position_ids=position_ids, **extra)
             logits = self.logits(x)[:, -1]
             next_token = self.sample_token(logits, temperature, top_k, top_p, min_p, repetition_penalty, initial_tokens + generated_token_ids, generator, do_sample=do_sample, presence_penalty=presence_penalty)
             token_id = next_token[0].item()
@@ -883,6 +919,9 @@ class BaseGenerate:
 
             embeds = self.model.embed_tokens(next_token).to(execution_dtype)
             current_input_ids = next_token if initial_input_ids is not None else None
+            if next_pos is not None:  # advance MRoPE position for the next (decode) step
+                position_ids = torch.tensor([[next_pos]], device=device)
+                next_pos += 1
             pbar.update(1)
 
             if token_id in stop_tokens:
@@ -896,22 +935,41 @@ class BaseGenerate:
             return torch.argmax(logits, dim=-1, keepdim=True)
 
         # Sampling mode
-        if repetition_penalty != 1.0:
-            for i in range(logits.shape[0]):
-                for token_id in set(token_history):
-                    logits[i, token_id] *= repetition_penalty if logits[i, token_id] < 0 else 1/repetition_penalty
-
-        if presence_penalty is not None and presence_penalty != 0.0:
-            for i in range(logits.shape[0]):
-                for token_id in set(token_history):
-                    logits[i, token_id] -= presence_penalty
+        if len(token_history) > 0 and (repetition_penalty != 1.0 or (presence_penalty is not None and presence_penalty != 0.0)):
+            token_ids = torch.tensor(list(set(token_history)), device=logits.device)
+            token_logits = logits[:, token_ids]
+            if repetition_penalty != 1.0:
+                token_logits = torch.where(token_logits < 0, token_logits * repetition_penalty, token_logits / repetition_penalty)
+            if presence_penalty is not None and presence_penalty != 0.0:
+                token_logits = token_logits - presence_penalty
+            logits[:, token_ids] = token_logits
 
         if temperature != 1.0:
             logits = logits / temperature
 
         if top_k > 0:
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = torch.finfo(logits.dtype).min
+            top_k = min(top_k, logits.shape[-1])
+            logits, top_indices = torch.topk(logits, top_k)
+
+            if min_p > 0.0:
+                probs_before_filter = torch.nn.functional.softmax(logits, dim=-1)
+                top_probs, _ = probs_before_filter.max(dim=-1, keepdim=True)
+                min_threshold = min_p * top_probs
+                indices_to_remove = probs_before_filter < min_threshold
+                logits[indices_to_remove] = torch.finfo(logits.dtype).min
+
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 0] = False
+                indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+                indices_to_remove.scatter_(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = torch.finfo(logits.dtype).min
+
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1, generator=generator)
+            return top_indices.gather(1, next_token)
 
         if min_p > 0.0:
             probs_before_filter = torch.nn.functional.softmax(logits, dim=-1)

@@ -26,7 +26,8 @@ class TextGenerate(io.ComfyNode):
 
         return io.Schema(
             node_id="TextGenerate",
-            category="textgen",
+            display_name="Generate Text",
+            category="text",
             search_aliases=["LLM", "gemma"],
             inputs=[
                 io.Clip.Input("clip"),
@@ -34,7 +35,7 @@ class TextGenerate(io.ComfyNode):
                 io.Image.Input("image", optional=True),
                 io.Image.Input("video", optional=True, tooltip="Video frames as image batch. Assumed to be 24 FPS; subsampled to 1 FPS internally."),
                 io.Audio.Input("audio", optional=True),
-                io.Int.Input("max_length", default=256, min=1, max=2048),
+                io.Int.Input("max_length", default=512, min=1, max=32768),
                 io.DynamicCombo.Input("sampling_mode", options=sampling_options, display_name="Sampling Mode"),
                 io.Boolean.Input("thinking", optional=True, default=False, tooltip="Operate in thinking mode if the model supports it."),
                 io.Boolean.Input("use_default_template", optional=True, default=True, tooltip="Use the built in system prompt/template if the model has one.", advanced=True),
@@ -157,6 +158,7 @@ class TextGenerateLTX2Prompt(TextGenerate):
         parent_schema = super().define_schema()
         return io.Schema(
             node_id="TextGenerateLTX2Prompt",
+            display_name="Generate LTX2 Prompt",
             category=parent_schema.category,
             inputs=parent_schema.inputs,
             outputs=parent_schema.outputs,
