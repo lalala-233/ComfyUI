@@ -76,7 +76,7 @@ try:
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             version = module.__version__
-            cuda_available = module.cuda != None
+            cuda_available = module.cuda is not None
 except:
     pass
 
